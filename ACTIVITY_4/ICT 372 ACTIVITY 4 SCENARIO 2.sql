@@ -1,0 +1,169 @@
+-- ICT371 PostgreSQL Scenario Assignment
+-- Scenario 2: Computer Laboratory Reservations
+-- Student number: 202301541
+
+DROP TABLE IF EXISTS reservations;
+DROP TABLE IF EXISTS lab_sessions;
+
+-- 1. Tables and sample data
+CREATE TABLE lab_sessions (
+    session_id             SERIAL PRIMARY KEY,
+    session_name           VARCHAR(50) NOT NULL,
+    available_workstations INT NOT NULL CHECK (available_workstations >= 0)
+);
+
+CREATE TABLE reservations (
+    reservation_id SERIAL PRIMARY KEY,
+    session_id     INT NOT NULL REFERENCES lab_sessions(session_id),
+    lecturer       VARCHAR(50) NOT NULL,
+    workstations   INT NOT NULL,
+    status         VARCHAR(10) NOT NULL DEFAULT 'RESERVED'
+);
+
+INSERT INTO lab_sessions (session_name, available_workstations) VALUES
+    ('Monday 08:00', 30),
+    ('Tuesday 10:00', 4),
+    ('Wednesday 14:00', 0);
+
+SELECT * FROM lab_sessions ORDER BY session_id;
+
+-- 2. IF / ELSIF / ELSE session status
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN SELECT session_name, available_workstations FROM lab_sessions ORDER BY session_id LOOP
+        IF r.available_workstations = 0 THEN
+            RAISE NOTICE '% : FULL', r.session_name;
+        ELSIF r.available_workstations <= 5 THEN
+            RAISE NOTICE '% : NEARLY FULL (%)', r.session_name, r.available_workstations;
+        ELSE
+            RAISE NOTICE '% : ENOUGH WORKSTATIONS (%)', r.session_name, r.available_workstations;
+        END IF;
+    END LOOP;
+END $$;
+
+-- 3. WHILE and numeric FOR
+DO $$
+DECLARE
+    i INT := 1;
+BEGIN
+    WHILE i <= 3 LOOP
+        RAISE NOTICE 'Session preparation reminder: %', i;
+        i := i + 1;
+    END LOOP;
+
+    FOR n IN 1..3 LOOP
+        RAISE NOTICE 'Workstation check number: %', n;
+    END LOOP;
+END $$;
+
+-- 4. reserve_workstations procedure
+CREATE OR REPLACE PROCEDURE reserve_workstations(p_session_id INT, p_lecturer VARCHAR, p_qty INT)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_available INT;
+BEGIN
+    IF p_qty IS NULL OR p_qty <= 0 THEN
+        RAISE EXCEPTION 'Invalid number of workstations: % (must be greater than zero)', p_qty;
+    END IF;
+
+    SELECT available_workstations INTO v_available
+    FROM lab_sessions WHERE session_id = p_session_id FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Session % does not exist', p_session_id;
+    END IF;
+
+    IF v_available < p_qty THEN
+        RAISE NOTICE 'Reservation REJECTED for %: requested %, only % available',
+                     p_lecturer, p_qty, v_available;
+        RETURN;
+    END IF;
+
+    UPDATE lab_sessions SET available_workstations = available_workstations - p_qty
+    WHERE session_id = p_session_id;
+
+    INSERT INTO reservations (session_id, lecturer, workstations)
+    VALUES (p_session_id, p_lecturer, p_qty);
+
+    RAISE NOTICE 'Reservation recorded for % : % workstation(s) in session %',
+                 p_lecturer, p_qty, p_session_id;
+END $$;
+
+-- 5. Two valid reservations and one exceeding capacity
+CALL reserve_workstations(1, 'Dr. Banda', 10);
+CALL reserve_workstations(2, 'Mr. Phiri', 3);
+CALL reserve_workstations(2, 'Ms. Mwansa', 5);   -- exceeds capacity, not recorded
+
+SELECT * FROM lab_sessions ORDER BY session_id;
+SELECT * FROM reservations ORDER BY reservation_id;
+
+-- 6. cancel_reservation procedure
+CREATE OR REPLACE PROCEDURE cancel_reservation(p_reservation_id INT)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_session_id INT;
+    v_qty        INT;
+    v_status     VARCHAR(10);
+BEGIN
+    SELECT session_id, workstations, status
+    INTO v_session_id, v_qty, v_status
+    FROM reservations WHERE reservation_id = p_reservation_id FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Reservation % does not exist', p_reservation_id;
+    END IF;
+
+    IF v_status = 'CANCELLED' THEN
+        RAISE NOTICE 'Reservation % already cancelled; nothing released', p_reservation_id;
+        RETURN;
+    END IF;
+
+    UPDATE lab_sessions SET available_workstations = available_workstations + v_qty
+    WHERE session_id = v_session_id;
+
+    UPDATE reservations SET status = 'CANCELLED'
+    WHERE reservation_id = p_reservation_id;
+
+    RAISE NOTICE 'Reservation % cancelled; % workstation(s) released', p_reservation_id, v_qty;
+END $$;
+
+CALL cancel_reservation(1);
+CALL cancel_reservation(1);   -- second call must not release again
+
+SELECT * FROM lab_sessions ORDER BY session_id;
+SELECT * FROM reservations ORDER BY reservation_id;
+
+-- 7. Explicit cursor: sessions with few workstations remaining
+DO $$
+DECLARE
+    cur_low CURSOR FOR
+        SELECT session_name, available_workstations FROM lab_sessions
+        WHERE available_workstations <= 5 ORDER BY available_workstations;
+    v_name  lab_sessions.session_name%TYPE;
+    v_avail lab_sessions.available_workstations%TYPE;
+BEGIN
+    OPEN cur_low;
+    LOOP
+        FETCH cur_low INTO v_name, v_avail;
+        EXIT WHEN NOT FOUND;
+        RAISE NOTICE 'Few workstations left: % (%)', v_name, v_avail;
+    END LOOP;
+    CLOSE cur_low;
+END $$;
+
+-- 8. Zero workstations handled with EXCEPTION block
+DO $$
+BEGIN
+    CALL reserve_workstations(1, 'Dr. Banda', 0);
+EXCEPTION
+    WHEN OTHERS THEN
+        RAISE NOTICE 'Error handled: %', SQLERRM;
+END $$;
+
+-- 9. Final state
+SELECT * FROM lab_sessions ORDER BY session_id;
+SELECT * FROM reservations ORDER BY reservation_id;
